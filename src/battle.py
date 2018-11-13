@@ -34,7 +34,13 @@ class Battle:
         :param req: json sent by server.
         :param websocket: Websocket stream.
         """
-        jsonobj = json.loads(req)
+        try:
+                jsonobj = json.loads(req)
+	
+        except ValueError as err: 
+                print("ERROR : " + req, err)
+
+		
         self.turn += 2
         objteam = jsonobj['side']['pokemon']
         self.bot_team = Team()
@@ -152,12 +158,17 @@ class Battle:
             best_switch = make_best_switch(self)[0]
         await senders.sendswitch(websocket, self.battletag, best_switch, self.turn)
 
-    async def make_action(self, websocket):
+    async def make_action(self, websocket, use_RL = False, suggested_action = None):
         """
         Launch best action chooser and call corresponding functions.
         :param websocket: Websocket stream.
         """
-        action = make_best_action(self)
+        if not use_RL:
+            action = make_best_action(self)
+        else:
+            action = suggested_action
+
+        print("THIS IS ACTION : ",action)
         if action[0] == "move":
             await self.make_move(websocket, action[1:])
         if action[0] == "switch":

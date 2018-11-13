@@ -2,19 +2,238 @@
 
 import asyncio
 import websockets
+import tensorflow as tf
+import random
+import numpy as np
+from collections import deque
 
+from src.memory import Memory
+from src.dqn import DQNetwork
+from src.hyperparams import hyperparams as hp
 from src.io_process import stringing
+from src.rlutils import make_state, give_reward, predict_action,  action_index_to_tuple, action_tuple_to_index
 
 async def main():
+    # Reset the graph
+    tf.reset_default_graph()
+
+    # Instantiate the DQNetwork
+    DQN = DQNetwork(hp.state_size, hp.action_size, hp.learning_rate, tf)
+    
+    memory = Memory(max_size = hp.memory_size, deque = deque)
     """
     Loading function. Connect websocket then launch bot.
     """
-    async with websockets.connect('ws://sim.smogon.com:8000/showdown/websocket') as websocket:
-        while True:
-            message = await websocket.recv()
-            print("<< {}".format(message))
-            await stringing(websocket, message)
+    async with websockets.connect('ws://localhost:8000/showdown/websocket') as websocket:
+        with tf.Session() as sess:
+            await pretrain(websocket,sess,memory)
 
+            if hp.training == True:
+                await train(websocket,sess,memory,DQN)
+
+
+
+async def pretrain(websocket,sess,memory):
+    sess.run(tf.global_variables_initializer())
+    episode_ctr = 0
+    state = None
+    done = False
+    while True:
+        message = await websocket.recv()
+        print("<< {}".format(message))
+        response = await stringing(websocket, message, use_RL=True)
+        
+        if response is not None and len(response) == 2:
+            [command, battle] = response
+        else:
+            command = ''
+
+        if command == 'Make Move':
+            
+            # Get new state
+            next_state = make_state(battle)
+            print(next_state.tolist())
+            
+            # Random action
+            possible_actions = battle.current_pkm[0]["moves"]
+            
+            while True:
+                choice = random.choice(list(enumerate(possible_actions)))[0]
+                if "disabled" in possible_actions[choice].keys() and possible_actions[choice]["disabled"]:
+                    continue
+                action_tuple = action_index_to_tuple(choice,'move')
+                action = choice + 1
+                break
+
+            print(possible_actions)
+            await stringing(websocket, message, use_RL=True, override=['move',action, 100])
+            
+            # Get the rewards
+            reward = give_reward(battle)
+
+            # Add experience to memory
+            if state is not None:
+                memory.add((state, action_tuple, reward, next_state, done))
+
+            state = next_state
+            
+        if command == 'deinit':
+            episode_ctr += 1
+            done = True
+            if state is not None:
+                memory.add((state, action_tuple, reward, next_state, done))
+            state = None
+            if(episode_ctr < hp.pretrain_length):
+                done = False
+                await stringing(websocket, message, newgame=True)
+            else:
+                break
+
+async def train(websocket,sess,memory,DQNetwork):
+    print('Training started')
+    # Setup TensorBoard Writer
+    writer = tf.summary.FileWriter("./tensorboard/dqn/1")
+
+    ## Losses
+    tf.summary.scalar("Loss", DQNetwork.loss)
+
+    write_op = tf.summary.merge_all()
+    saver = tf.train.Saver()
+    
+    # Initialize the variables
+    sess.run(tf.global_variables_initializer())
+    
+    # Initialize the decay rate (that will use to reduce epsilon) 
+    decay_step = 0
+
+    done = False
+    episode_ctr = 0
+
+    # Set step to 0
+    step = 0
+    
+    # Initialize the rewards of the episode
+    episode_rewards = []
+
+    state = None
+    
+    await stringing(websocket, '|deinit', newgame=True)
+    while True:
+        if(episode_ctr >= hp.total_episodes):
+            break
+
+        message = await websocket.recv()
+        print("<< {}".format(message))
+        response = await stringing(websocket, message, use_RL=True)
+        
+        if response is not None and len(response) == 2:
+            [command, battle] = response
+        else:
+            command = ''
+
+        if command == 'Make Move':
+            step += 1
+                
+            # Increase decay_step
+            decay_step +=1
+
+            # Get new state
+            next_state = make_state(battle)
+            print(next_state.tolist())
+            
+            # Random action
+            possible_actions = battle.current_pkm[0]["moves"]
+            possible_actions_tuple = list(action_index_to_tuple(i,'move') for i in range(4))
+            #action = random.choice(list(enumerate(possible_actions)))[0] + 1
+
+            action_tuple, explore_probability = predict_action(hp.explore_start, hp.explore_stop, hp.decay_rate, decay_step, next_state, possible_actions_tuple,sess=sess, DQNetwork=DQNetwork)
+            action = action_tuple_to_index(action_tuple) + 1
+
+            print(possible_actions)
+            
+            await stringing(websocket, message, use_RL=True, override=['move',action, 100])
+            
+            # Get the rewards
+            reward = give_reward(battle)
+
+            # Add the reward to total reward
+            episode_rewards.append(reward)
+
+            # Add experience to memory
+            if state is not None:
+                memory.add((state, action_tuple, reward, next_state, done))
+    
+            state = next_state
+
+        if command == 'deinit':
+            episode_ctr += 1
+            done = True
+
+            # Get the total reward of the episode
+            total_reward = np.sum(episode_rewards)
+
+            print('Episode: {}'.format(episode_ctr),
+                        'Total reward: {}'.format(total_reward),
+                        'Training loss: {:.4f}'.format(loss),
+                        'Explore P: {:.4f}'.format(explore_probability))
+
+            if state is not None:
+                memory.add((state, action_tuple, reward, next_state, done))
+            state = None
+            if(episode_ctr < hp.pretrain_length):
+                done = False
+                episode_rewards = []
+                step = 0
+                await stringing(websocket, message, newgame=True)
+        
+        ### LEARNING PART            
+        # Obtain random mini-batch from memory
+        batch = memory.sample(hp.batch_size)
+        states_mb = np.array([each[0] for each in batch], ndmin=2)
+        actions_mb = np.array([each[1] for each in batch])
+        rewards_mb = np.array([each[2] for each in batch]) 
+        next_states_mb = np.array([each[3] for each in batch], ndmin=2)
+        dones_mb = np.array([each[4] for each in batch])
+
+        target_Qs_batch = []
+
+        print('Learning')
+        print(next_states_mb[0].shape)
+        print(next_states_mb[0].tolist())
+        # Get Q values for next_state 
+        Qs_next_state = sess.run(DQNetwork.output, feed_dict = {DQNetwork.inputs_: next_states_mb})
+        
+        # Set Q_target = r if the episode ends at s+1, otherwise set Q_target = r + gamma*maxQ(s', a')
+        for i in range(0, len(batch)):
+            terminal = dones_mb[i]
+
+            # If we are in a terminal state, only equals reward
+            if terminal:
+                target_Qs_batch.append(rewards_mb[i])
+                
+            else:
+                target = rewards_mb[i] + hp.gamma * np.max(Qs_next_state[i])
+                target_Qs_batch.append(target)
+                
+
+        targets_mb = np.array([each for each in target_Qs_batch])
+
+        loss, _ = sess.run([DQNetwork.loss, DQNetwork.optimizer],
+                            feed_dict={DQNetwork.inputs_: states_mb,
+                                        DQNetwork.target_Q: targets_mb,
+                                        DQNetwork.actions_: actions_mb})
+
+        # Write TF Summaries
+        summary = sess.run(write_op, feed_dict={DQNetwork.inputs_: states_mb,
+                                            DQNetwork.target_Q: targets_mb,
+                                            DQNetwork.actions_: actions_mb})
+        writer.add_summary(summary, episode_ctr)
+        writer.flush()
+
+    # Save model every 5 episodes
+    if episode_ctr % 5 == 0:
+        save_path = saver.save(sess, "./models/model.ckpt")
+        print("Model Saved")
 
 def test():
     """

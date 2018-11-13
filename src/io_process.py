@@ -32,7 +32,7 @@ def check_battle(battle_list, battletag) -> Battle or None:
             return battle
     return None
 
-async def battle_tag(websocket, message, usage):
+async def battle_tag(websocket, message, usage, use_RL = False, override = None):
     """
     Main in fuction. Filter every message sent by server and launch corresponding function.
     :param websocket: Websocket stream.
@@ -56,6 +56,7 @@ async def battle_tag(websocket, message, usage):
                 battle.player_id = current[2]
                 battle.turn += int(current[2].split('p')[1]) - 1
             elif current[1] == "request":
+                print('request')
                 if current[2] == '':
                     continue;
                 # Maj team bot
@@ -71,8 +72,15 @@ async def battle_tag(websocket, message, usage):
                 # Selection d'ordre des pokemons
                 await battle.make_team_order(websocket)
             elif current[1] == "turn":
-                # Phase de reflexion
-                await battle.make_action(websocket)
+                if use_RL:
+                    if override is not None:
+                        # Phase de reflexion
+                        await battle.make_action(websocket, use_RL = True, suggested_action = override)
+                    else:
+                        return [ 'Make Move' , battle ]
+                else:
+                    await battle.make_action(websocket)
+
             elif current[1] == "callback" and current[2] == "trapped":
                 await battle.make_move(websocket)
             elif current[1] == "win":
@@ -96,7 +104,7 @@ async def battle_tag(websocket, message, usage):
         except IndexError:
             pass
 
-async def stringing(websocket, message, usage=0):
+async def stringing(websocket, message, usage=1, newgame=False, use_RL=False, override=None):
     """
     First filtering function on received messages.
     Handle challenge and research actions.
@@ -117,17 +125,16 @@ async def stringing(websocket, message, usage=0):
     elif string_tab[1] == "updateuser" and string_tab[2] == "SuchTestBot":
         # Once we are connected.
         if usage == 1:
-            await senders.challenge(websocket, "Synedh", formats[0])
+            await senders.challenge(websocket, "bigbadbot", formats[0])
         if usage == 2:
             await senders.searching(websocket, formats[0])
             nb_fights += 1
-    elif string_tab[1] == "deinit" and usage == 2:
+    elif string_tab[1] == "deinit" and newgame == False:
         # If previous fight is over and we're in 2nd usage
-        if nb_fights < nb_fights_max:  # If it remains fights
-            await senders.searching(websocket, formats[0])
-            nb_fights += 1
-        elif nb_fights >= nb_fights_max and len(battles) == 0:  # If it don't remains fights
-            exit(0)
+        return ['deinit', None]
+    elif string_tab[1] == "deinit" and newgame == True:
+        # If previous fight is over and we're in 2nd usage
+        await senders.challenge(websocket, "bigbadbot", formats[0])
     elif "|inactive|Battle timer is ON:" in message and usage == 2:
         # If previous fight has started and we can do more simultaneous fights and we're in 2nd usage.
         if len(battles) < nb_fights_simu_max and nb_fights < nb_fights_max:
@@ -155,5 +162,16 @@ async def stringing(websocket, message, usage=0):
             await senders.sender(websocket, "", "/pm " + string_tab[2] + ", Unknown command, type \".info\" for help.")
 
     if "battle" in string_tab[0]:
-        # Battle concern message.
-        await battle_tag(websocket, message, usage)
+        if use_RL:
+            # Battle concern message.
+            res = await battle_tag(websocket, message, usage, use_RL, override)
+            if res is not None and len(res) == 2:
+                [ command, battle ] = res
+            else:
+                command = None
+
+            if command is not None:
+                if command == 'Make Move':
+                    return [command, battle]
+        else:
+            await battle_tag(websocket, message, usage)
